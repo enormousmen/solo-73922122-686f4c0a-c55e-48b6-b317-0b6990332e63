@@ -199,11 +199,13 @@ class LayoutBuilder:
 
 def build_demo_layout(
     out_dir: Path,
-    meta_path: Path,
+    meta_path: Path | None = None,
     *,
     amd64_payload_bytes: int = 512 * 1024,
     arm64_payload_bytes: int = 512 * 1024,
     layers: int = 2,
+    versions: tuple[str, ...] = ("v1", "v2", "v3"),
+    payload_sizes: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Layout with stable v1 preloaded plus candidate v2/v3 manifests.
 
@@ -213,25 +215,27 @@ def build_demo_layout(
 
     amd64 layers can be made deliberately larger than arm64 so the concurrent
     demo has a slow scan on one architecture and a fast one on the other.
+
+    ``payload_sizes`` may override the payload size of any
+    ``{version: {arch: bytes}}`` combination; omitted entries fall back to the
+    arch-wide ``*_payload_bytes`` argument.
     """
     builder = LayoutBuilder(out_dir)
-    payloads = {"amd64": amd64_payload_bytes, "arm64": arm64_payload_bytes}
+    base_payloads = {"amd64": amd64_payload_bytes, "arm64": arm64_payload_bytes}
     descriptors: dict[str, dict[str, dict[str, Any]]] = {}
-    versions = {
-        "v1": {"amd64": "v1", "arm64": "v1"},
-        "v2": {"amd64": "v2", "arm64": "v2"},
-        "v3": {"amd64": "v3", "arm64": "v3"},
-    }
     variants = {"amd64": None, "arm64": "v8"}
-    for version in ("v1", "v2", "v3"):
+    for version in versions:
         descriptors[version] = {}
         for arch in ("amd64", "arm64"):
+            payload_bytes = (
+                (payload_sizes or {}).get(version, {}).get(arch, base_payloads[arch])
+            )
             descriptors[version][arch] = builder.add_image(
                 arch=arch,
                 version=version,
                 variant=variants[arch],
                 layers=layers,
-                payload_bytes=payloads[arch],
+                payload_bytes=payload_bytes,
             )
 
     ref = "registry.example.com/edge/stable:latest"
@@ -245,9 +249,100 @@ def build_demo_layout(
         "indexDigest": written["indexDigest"],
         "layout": str(out_dir),
     }
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if meta_path is not None:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     return meta
+
+
+def build_standby_layout(
+    out_dir: Path,
+    meta_path: Path | None = None,
+    *,
+    layers: int = 2,
+    payload_sizes: dict[str, dict[str, int]] | None = None,
+) -> dict[str, Any]:
+    """Build the restricted standby library mounted at /oci-layout-standby.
+
+    Content is deterministic with the same builder parameters, so its v1
+    manifests/configs/layers have *exactly the same digests* as the primary
+    layout's v1 and validate the persisted stable index.  It intentionally
+    contains only what a standby needs before maintenance:
+
+    * v1 for both architectures (the deployed stable baseline),
+    * arm64 v2 as one mirrored post-maintenance candidate,
+
+    and deliberately lacks amd64 v2/v3 and arm64 v3 — unpublished images do
+    not have to exist in the backup library.
+    """
+    sizes = payload_sizes or {}
+
+    def size(version: str, arch: str, default: int) -> int:
+        return sizes.get(version, {}).get(arch, default)
+
+    builder = LayoutBuilder(out_dir)
+    descriptors: dict[str, dict[str, dict[str, Any]]] = {"v1": {}, "v2": {}}
+    for arch in ("amd64", "arm64"):
+        descriptors["v1"][arch] = builder.add_image(
+            arch=arch,
+            version="v1",
+            variant="v8" if arch == "arm64" else None,
+            layers=layers,
+            payload_bytes=size("v1", arch, 512 * 1024),
+        )
+    # One mirrored candidate so a clean cut-over can still publish arm64 v2.
+    descriptors["v2"]["arm64"] = builder.add_image(
+        arch="arm64",
+        version="v2",
+        variant="v8",
+        layers=layers,
+        payload_bytes=size("v2", "arm64", 512 * 1024),
+    )
+
+    ref = "registry.example.com/edge/stable:latest"
+    preloaded = [descriptors["v1"]["amd64"], descriptors["v1"]["arm64"]]
+    written = builder.write_index(preloaded=preloaded, ref_name=ref, nested=True)
+    meta = {
+        "ref": ref,
+        "preloadedVersion": "v1",
+        "versions": descriptors,
+        "indexDigest": written["indexDigest"],
+        "layout": str(out_dir),
+        "note": "standby library: v1 both architectures plus arm64 v2 only",
+    }
+    if meta_path is not None:
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    return meta
+
+
+def build_demo_pair(
+    *,
+    primary_out: Path,
+    primary_meta: Path,
+    standby_out: Path,
+    standby_meta: Path,
+    layers: int = 2,
+    payload_sizes: dict[str, dict[str, int]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the two fixed layouts mounted by Docker Compose."""
+    primary = build_demo_layout(
+        primary_out,
+        primary_meta,
+        layers=layers,
+        payload_sizes=payload_sizes,
+    )
+    standby = build_standby_layout(
+        standby_out,
+        standby_meta,
+        layers=layers,
+        payload_sizes=payload_sizes,
+    )
+    return primary, standby
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,22 +355,98 @@ def main(argv: list[str] | None = None) -> int:
         "--amd64-payload-bytes",
         type=int,
         default=512 * 1024,
-        help="random payload per amd64 layer (bigger = slower verification)",
+        help="random payload per amd64 layer for every version (bigger = slower verification)",
     )
     parser.add_argument(
         "--arm64-payload-bytes",
         type=int,
         default=512 * 1024,
-        help="random payload per arm64 layer",
+        help="random payload per arm64 layer for every version",
+    )
+    parser.add_argument(
+        "--v1-amd64-payload-bytes",
+        type=int,
+        default=None,
+        help="override amd64 v1 payload (the switch-validation scan)",
+    )
+    parser.add_argument(
+        "--v1-arm64-payload-bytes",
+        type=int,
+        default=None,
+        help="override arm64 v1 payload",
+    )
+    parser.add_argument(
+        "--candidate-amd64-payload-bytes",
+        type=int,
+        default=None,
+        help="override amd64 v2/v3 payload (the slow in-flight release scan)",
+    )
+    parser.add_argument(
+        "--candidate-arm64-payload-bytes",
+        type=int,
+        default=None,
+        help="override arm64 v2/v3 payload",
     )
     parser.add_argument("--layers", type=int, default=2, help="layers per image")
+    parser.add_argument(
+        "--pair",
+        action="store_true",
+        help="also build the restricted standby layout for registry-switch demos",
+    )
+    parser.add_argument("--standby-out", default="/oci-layout-standby")
+    parser.add_argument(
+        "--standby-meta", default="/oci-layout-standby/demo-standby-digests.json"
+    )
     args = parser.parse_args(argv)
+
+    candidate_amd = (
+        args.candidate_amd64_payload_bytes
+        if args.candidate_amd64_payload_bytes is not None
+        else args.amd64_payload_bytes
+    )
+    candidate_arm = (
+        args.candidate_arm64_payload_bytes
+        if args.candidate_arm64_payload_bytes is not None
+        else args.arm64_payload_bytes
+    )
+    v1_amd = (
+        args.v1_amd64_payload_bytes
+        if args.v1_amd64_payload_bytes is not None
+        else args.amd64_payload_bytes
+    )
+    v1_arm = (
+        args.v1_arm64_payload_bytes
+        if args.v1_arm64_payload_bytes is not None
+        else args.arm64_payload_bytes
+    )
+    payload_sizes = {
+        "v1": {"amd64": v1_amd, "arm64": v1_arm},
+        "v2": {"amd64": candidate_amd, "arm64": candidate_arm},
+        "v3": {"amd64": candidate_amd, "arm64": candidate_arm},
+    }
+
+    if args.pair:
+        primary, standby = build_demo_pair(
+            primary_out=Path(args.out),
+            primary_meta=Path(args.meta),
+            standby_out=Path(args.standby_out),
+            standby_meta=Path(args.standby_meta),
+            layers=args.layers,
+            payload_sizes=payload_sizes,
+        )
+        print(json.dumps(primary["versions"], indent=2, sort_keys=True))
+        print(
+            f"wrote primary layout to {args.out} ({args.meta}) and standby layout "
+            f"to {args.standby_out} ({args.standby_meta})"
+        )
+        print("standby versions:", sorted(standby["versions"]))
+        return 0
+
     meta = build_demo_layout(
         Path(args.out),
         Path(args.meta),
-        amd64_payload_bytes=args.amd64_payload_bytes,
-        arm64_payload_bytes=args.arm64_payload_bytes,
         layers=args.layers,
+        payload_sizes=payload_sizes,
     )
     print(json.dumps(meta["versions"], indent=2, sort_keys=True))
     print(f"wrote layout to {args.out} and metadata to {args.meta}")

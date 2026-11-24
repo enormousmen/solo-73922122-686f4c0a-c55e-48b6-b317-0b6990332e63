@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_ARCHITECTURES: tuple[str, ...] = ("amd64", "arm64")
+PRIMARY_REGISTRY = "primary"
+STANDBY_REGISTRY = "standby"
+DEFAULT_STANDBY_LAYOUT = "/oci-layout-standby"
 
 
 class ConfigError(ValueError):
@@ -31,12 +34,21 @@ class Settings:
     architectures: tuple[str, ...] = DEFAULT_ARCHITECTURES
     layer_chunk_bytes: int = 64 * 1024
     layer_chunk_delay: float = 0.0
+    # Named, content-fixed read-only OCI layouts the operator may switch
+    # between.  ``primary`` always equals ``oci_layout``; additional targets
+    # come from OCI_STANDBY_LAYOUT_DIR / OCI_REGISTRY_LAYOUTS.  The active
+    # target is *not* configuration: it lives in the shared state volume so
+    # every worker and every restart observes the same effective registry.
+    registry_dirs: dict[str, Path] = field(default_factory=dict)
     allowed_media_types: tuple[str, ...] = field(
         default_factory=lambda: (
             "application/vnd.oci.image.manifest.v1+json",
             "application/vnd.docker.distribution.manifest.v2+json",
         )
     )
+
+    def layout_dir_for(self, name: str) -> Path | None:
+        return self.registry_dirs.get(name)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Settings":
@@ -47,6 +59,8 @@ class Settings:
         raw_ref = env.get("OCI_INDEX_REF", "registry.example.com/edge/stable:latest")
         raw_chunk = env.get("LAYER_CHUNK_BYTES", str(64 * 1024))
         raw_chunk_delay = env.get("LAYER_CHUNK_DELAY_MS", "0")
+        raw_standby = env.get("OCI_STANDBY_LAYOUT_DIR", DEFAULT_STANDBY_LAYOUT)
+        raw_extra_targets = env.get("OCI_REGISTRY_LAYOUTS", "")
 
         architectures = tuple(_split(raw_archs))
         if not architectures:
@@ -74,6 +88,35 @@ class Settings:
         if not raw_ref.strip() or any(c.isspace() for c in raw_ref):
             raise ConfigError("OCI_INDEX_REF must be a non-empty reference without spaces")
 
+        registry_dirs: dict[str, Path] = {PRIMARY_REGISTRY: Path(raw_layout)}
+        if raw_standby.strip():
+            registry_dirs[STANDBY_REGISTRY] = Path(raw_standby.strip())
+        # Generic form: OCI_REGISTRY_LAYOUTS="mirror=/layouts/mirror,dr=/layouts/dr"
+        for entry in _split(raw_extra_targets):
+            if "=" not in entry:
+                raise ConfigError(
+                    "OCI_REGISTRY_LAYOUTS entries must be 'name=/path', got "
+                    f"{entry!r}"
+                )
+            target_name, target_path = entry.split("=", 1)
+            target_name = target_name.strip()
+            target_path = target_path.strip()
+            if not target_name or not target_path:
+                raise ConfigError(
+                    f"OCI_REGISTRY_LAYOUTS entry {entry!r} has an empty name or path"
+                )
+            if "/" in target_name or not all(
+                ch.isalnum() or ch in "_-" for ch in target_name
+            ):
+                raise ConfigError(
+                    f"invalid registry target name {target_name!r}; use [A-Za-z0-9_-]"
+                )
+            if target_name == PRIMARY_REGISTRY:
+                raise ConfigError(
+                    f"{PRIMARY_REGISTRY!r} registry target is fixed by OCI_LAYOUT_DIR"
+                )
+            registry_dirs[target_name] = Path(target_path)
+
         return cls(
             oci_layout=Path(raw_layout),
             state_dir=Path(raw_state),
@@ -81,6 +124,7 @@ class Settings:
             architectures=architectures,
             layer_chunk_bytes=chunk,
             layer_chunk_delay=chunk_delay_ms / 1000.0,
+            registry_dirs=registry_dirs,
         )
 
     def media_type_allowed(self, media_type: object) -> bool:

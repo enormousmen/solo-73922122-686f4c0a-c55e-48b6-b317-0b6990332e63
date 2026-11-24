@@ -1,7 +1,11 @@
 name: edge-stable-release
 
-# One-shot job that writes a preloaded dual-architecture (amd64 + arm64) stable
-# index into the shared `oci-layout` volume.
+# One-shot job that writes two preloaded dual-architecture (amd64 + arm64) OCI
+# layouts into shared volumes:
+#   oci-layout          -> full primary library (stable v1 + v2/v3 candidates)
+#   oci-layout-standby  -> restricted backup library (stable v1 both arches +
+#                          only the arm64 v2 candidate; unpublished images may
+#                          be missing there)
 services:
   layout-init:
     build:
@@ -9,6 +13,7 @@ services:
       dockerfile: Dockerfile.layout
     volumes:
       - oci-layout:/oci-layout
+      - oci-layout-standby:/oci-layout-standby
     restart: "no"
 
   release-api:
@@ -21,17 +26,22 @@ services:
     environment:
       PYTHONPATH: /srv
       OCI_LAYOUT_DIR: /oci-layout
+      # Named target accepted by POST /v1/registry/switch {"target":"standby"}.
+      OCI_STANDBY_LAYOUT_DIR: /oci-layout-standby
       STATE_DIR: /state
       OCI_INDEX_REF: registry.example.com/edge/stable:latest
       OCI_ARCHITECTURES: amd64,arm64
       LAYER_CHUNK_BYTES: "65536"
-      # Demo-only: stretch the layer scan so the concurrency demo is visible on
-      # small demo layers. Set to 0 for real deployments.
+      # Demo-only: stretch the layer scan so the commit-order races in
+      # examples/demo_switch.py are visible on small demo layers. Set to 0.
       LAYER_CHUNK_DELAY_MS: "1"
     volumes:
-      # Read-only: the service can never mutate the image layout.
+      # Read-only: the service can never mutate either image layout.
       - oci-layout:/oci-layout:ro
-      # Durable last-success state, survives restarts and recreations.
+      - oci-layout-standby:/oci-layout-standby:ro
+      # Durable last-success state (stable index AND effective registry),
+      # survives restarts and recreations. A pre-feature state volume without
+      # registry fields defaults to the primary /oci-layout library.
       - release-state:/state
     ports:
       - "8000:8000"
@@ -41,4 +51,5 @@ services:
 
 volumes:
   oci-layout:
+  oci-layout-standby:
   release-state:

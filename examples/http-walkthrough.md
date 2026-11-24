@@ -136,3 +136,16 @@ $ curl -s localhost:8000/v1/stable | jq '.manifests[].digest'
 
 The last successful release is served from `/state/stable-index.json`; a failed
 release never overwrites it.
+
+## 8. Switching to the standby registry
+
+The maintenance cut-over API, both commit-order races (publish-first vs
+switch-first), and restart semantics are documented in
+[`registry-switch.md`](./registry-switch.md) and scripted in
+[`demo_switch.py`](./demo_switch.py):
+
+```console
+docker compose exec release-api python /srv/examples/demo_switch.py --case publish-first
+```
+
+`GET /healthz` always reports the currently effective `registry`.

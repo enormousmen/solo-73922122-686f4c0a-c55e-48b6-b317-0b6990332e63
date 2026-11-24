@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     OCI_LAYOUT_DIR=/oci-layout \
+    OCI_STANDBY_LAYOUT_DIR=/oci-layout-standby \
     STATE_DIR=/state \
     OCI_INDEX_REF=registry.example.com/edge/stable:latest
 
@@ -16,10 +17,11 @@ COPY app ./app
 COPY scripts ./scripts
 COPY examples ./examples
 
-# The layout is mounted read-only at runtime; /state is the only writable path.
-# Both directories are pre-created with the runtime user's ownership so Docker
-# seeds named volumes with permissions the unprivileged process can use.
-RUN mkdir -p /state /oci-layout && chown -R 10001:10001 /state /oci-layout
+# Both layouts are mounted read-only at runtime; /state is the only writable
+# path.  Pre-create the mount points (and /state) with the runtime user's
+# ownership so Docker seeds named volumes with usable permissions.
+RUN mkdir -p /state /oci-layout /oci-layout-standby \
+    && chown -R 10001:10001 /state /oci-layout /oci-layout-standby
 
 USER 10001:10001
 EXPOSE 8000

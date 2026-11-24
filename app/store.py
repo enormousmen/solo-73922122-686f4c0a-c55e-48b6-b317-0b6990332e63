@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import Settings
+from .config import PRIMARY_REGISTRY, Settings
 from .oci import (
     INDEX_MEDIA_TYPES,
     OCI_INDEX_MEDIA_TYPE,
@@ -58,6 +58,35 @@ class ConflictError(Exception):
         self.current = current
 
 
+class RegistryChangedError(Exception):
+    """The effective registry generation changed after a release was verified."""
+
+    def __init__(self, registry: str, generation: int) -> None:
+        super().__init__(
+            f"active registry changed; now {registry!r} at generation {generation}"
+        )
+        self.registry = registry
+        self.generation = generation
+
+
+class StableCoverageError(Exception):
+    """Switch validation does not cover the stable index read at commit time."""
+
+    def __init__(
+        self,
+        validated: dict[str, str],
+        current: dict[str, str],
+        revision: int,
+    ) -> None:
+        super().__init__(
+            "validated stable digests no longer cover commit-time stable: "
+            f"validated={validated}, current={current}"
+        )
+        self.validated = dict(validated)
+        self.current = dict(current)
+        self.revision = revision
+
+
 class StoreError(Exception):
     """Persisted state could not be read or written."""
 
@@ -69,6 +98,20 @@ class StoreSnapshot:
     updated_at: str | None
     etag: str
     persisted: bool
+    registry: str = PRIMARY_REGISTRY
+    registry_generation: int = 0
+    registry_updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class SwitchResult:
+    previous_registry: str
+    registry: str
+    generation: int
+    changed: bool
+    revision: int
+    updated_at: str | None
+    registry_updated_at: str | None
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -94,6 +137,38 @@ def _read_json(path: Path) -> Any:
         return json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StoreError(f"cannot parse {path}: {exc}") from exc
+
+
+def _registry_fields(state: dict[str, Any]) -> tuple[str, int, str | None]:
+    """Return (active registry name, generation, switched-at).
+
+    State files written before registry switching existed carry no such keys;
+    those old volumes must keep using the original (primary) layout.
+    """
+    registry = state.get("registry", PRIMARY_REGISTRY)
+    if not isinstance(registry, str) or not registry:
+        registry = PRIMARY_REGISTRY
+    generation = state.get("registryGeneration", 0)
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        generation = 0
+    switched_at = state.get("registryUpdatedAt")
+    if not isinstance(switched_at, str):
+        switched_at = None
+    return registry, generation, switched_at
+
+
+def stable_digest_map(index: dict[str, Any]) -> dict[str, str]:
+    """architecture -> manifest digest for a stable OCI index."""
+    result: dict[str, str] = {}
+    for desc in index.get("manifests") or []:
+        if not isinstance(desc, dict):
+            continue
+        platform = desc.get("platform") or {}
+        arch = platform.get("architecture")
+        digest = desc.get("digest")
+        if isinstance(arch, str) and isinstance(digest, str):
+            result[arch] = digest
+    return result
 
 
 class StableStore:
@@ -144,6 +219,10 @@ class StableStore:
                     "revision": 0,
                     "updatedAt": None,
                     "published": {},
+                    # A freshly seeded volume starts on the original layout.
+                    "registry": PRIMARY_REGISTRY,
+                    "registryGeneration": 0,
+                    "registryUpdatedAt": None,
                     "index": index,
                 }
                 try:
@@ -372,12 +451,16 @@ class StableStore:
 
     def _snapshot_from_state(self, state: dict[str, Any]) -> StoreSnapshot:
         index = state["index"]
+        registry, generation, switched_at = _registry_fields(state)
         return StoreSnapshot(
             index=copy.deepcopy(index),
             revision=state["revision"],
             updated_at=state.get("updatedAt"),
             etag=_etag_for(index),
             persisted=True,
+            registry=registry,
+            registry_generation=generation,
+            registry_updated_at=switched_at,
         )
 
     def _fallback_snapshot(self) -> StoreSnapshot:
@@ -391,6 +474,9 @@ class StableStore:
             updated_at=None,
             etag=_etag_for(index),
             persisted=False,
+            registry=PRIMARY_REGISTRY,
+            registry_generation=0,
+            registry_updated_at=None,
         )
 
     def snapshot(self) -> StoreSnapshot:
@@ -441,8 +527,16 @@ class StableStore:
         self,
         verified: VerifiedRelease,
         expected_previous_digest: str,
+        *,
+        expected_generation: int | None = None,
     ) -> tuple[StoreSnapshot, dict[str, Any]]:
-        """Cas-swap one architecture's descriptor and persist atomically."""
+        """Cas-swap one architecture's descriptor and persist atomically.
+
+        When ``expected_generation`` is given it must equal the durable active
+        registry generation inside the same lock; otherwise
+        :class:`RegistryChangedError` is raised before any compare-and-swap so
+        the caller can re-verify the candidate against the new registry.
+        """
         expected_previous_digest = validate_digest(
             expected_previous_digest, what="expectedPreviousDigest"
         )
@@ -450,6 +544,12 @@ class StableStore:
             # Re-read inside the lock so a concurrent writer (even in another
             # process) always forms the baseline for the compare-and-swap.
             state = self._load_state_file()
+            registry, generation, registry_updated_at = _registry_fields(state)
+            if (
+                expected_generation is not None
+                and generation != expected_generation
+            ):
+                raise RegistryChangedError(registry, generation)
             current = state["index"]
             position = self._find_platform(current, verified.architecture)
             if position is None:
@@ -487,9 +587,57 @@ class StableStore:
                 "updatedAt": updated_at,
                 "published": published,
                 "index": new_index,
+                # A release never changes which registry is effective.
+                "registry": registry,
+                "registryGeneration": generation,
+                "registryUpdatedAt": registry_updated_at,
             }
             self._write_state(new_state)
             snapshot = self._snapshot_from_state(new_state)
             with self._memory_lock:
                 self._fallback = snapshot.index
             return snapshot, published[verified.architecture]
+
+    def commit_switch(
+        self,
+        target_registry: str,
+        validated_digests: dict[str, str],
+    ) -> SwitchResult:
+        """Atomically activate ``target_registry`` if validation still covers stable.
+
+        The stable index, its revision and ``updatedAt`` are carried through
+        untouched: switching libraries is not a release.  Only the registry
+        fields change (and ``registryGeneration`` when the name changes).
+        """
+        with self._file_lock():
+            state = self._load_state_file()
+            current_digests = stable_digest_map(state["index"])
+            if dict(validated_digests) != current_digests:
+                raise StableCoverageError(
+                    validated=validated_digests,
+                    current=current_digests,
+                    revision=state["revision"],
+                )
+
+            previous_registry, generation, switched_at = _registry_fields(state)
+            changed = previous_registry != target_registry
+            if changed:
+                generation += 1
+                switched_at = _utc_now()
+
+            new_state = dict(state)
+            new_state["registry"] = target_registry
+            new_state["registryGeneration"] = generation
+            new_state["registryUpdatedAt"] = switched_at
+            # Explicitly preserve release fields even if an old state file
+            # lacked the registry keys (dict(state) already references them).
+            self._write_state(new_state)
+            return SwitchResult(
+                previous_registry=previous_registry,
+                registry=target_registry,
+                generation=generation,
+                changed=changed,
+                revision=state["revision"],
+                updated_at=state.get("updatedAt"),
+                registry_updated_at=switched_at,
+            )
